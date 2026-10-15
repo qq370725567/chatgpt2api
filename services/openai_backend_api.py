@@ -155,9 +155,9 @@ class OpenAIBackendAPI:
 
     说明：
     - 传入 `access_token` 时，聊天和模型列表都会走已登录链路
-      例如 `/backend-api/sentinel/chat-requirements`、`/backend-api/conversation`
+      例如 `/backend-api/sentinel/chat-requirements`、`/backend-api/f/conversation`
     - 不传 `access_token` 时，会走未登录链路
-      例如 `/backend-anon/sentinel/chat-requirements`、`/backend-anon/conversation`
+      例如 `/backend-anon/sentinel/chat-requirements`、`/backend-anon/f/conversation`
     - `stream_conversation()` 是底层统一流式入口
     - 协议兼容转换放在 `services.protocol`
     """
@@ -420,13 +420,16 @@ class OpenAIBackendAPI:
             raw_finalize=data,
         )
 
-    def _conversation_headers(self, path: str, requirements: ChatRequirements) -> Dict[str, str]:
+    def _conversation_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "") -> Dict[str, str]:
         """根据当前 requirements 构造对话 SSE 请求头。"""
         headers = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
             "OpenAI-Sentinel-Chat-Requirements-Token": requirements.token,
+            "X-Oai-Turn-Trace-Id": new_uuid(),
         }
+        if conduit_token:
+            headers["X-Conduit-Token"] = conduit_token
         if requirements.proof_token:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
         if requirements.turnstile_token:
@@ -525,27 +528,29 @@ class OpenAIBackendAPI:
             timezone: str,
             thinking_effort: str = "",
     ) -> Dict[str, Any]:
-        """把标准 messages 构造成 web 对话请求体。"""
+        """把标准 messages 构造成 web `/f/conversation` 请求体。"""
+        conversation_messages = self._api_messages_to_conversation_messages(messages)
+        for item in conversation_messages:
+            item["create_time"] = time.time()
+            metadata = item.setdefault("metadata", {})
+            metadata.setdefault("developer_mode_connector_ids", [])
+            metadata.setdefault("selected_github_repos", [])
+            metadata.setdefault("selected_all_github_repos", False)
+            metadata.setdefault("serialization_metadata", {"custom_symbol_offsets": []})
         payload = {
             "action": "next",
-            "messages": self._api_messages_to_conversation_messages(messages),
+            "messages": conversation_messages,
+            "parent_message_id": "client-created-root",
             "model": model,
-            "parent_message_id": new_uuid(),
-            "conversation_mode": {"kind": "primary_assistant"},
-            "conversation_origin": None,
-            "force_paragen": False,
-            "force_paragen_model_slug": "",
-            "force_rate_limit": False,
-            "force_use_sse": True,
-            "history_and_training_disabled": True,
-            "reset_rate_limits": False,
-            "suggestions": [],
-            "supported_encodings": [],
-            "system_hints": [],
-            "timezone": timezone,
+            "client_prepare_state": "success",
             "timezone_offset_min": -480,
-            "variant_purpose": "comparison_implicit",
-            "websocket_request_id": new_uuid(),
+            "timezone": timezone,
+            "history_and_training_disabled": True,
+            "conversation_mode": {"kind": "primary_assistant"},
+            "enable_message_followups": True,
+            "system_hints": [],
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
             "client_contextual_info": {
                 "is_dark_mode": False,
                 "time_since_loaded": 120,
@@ -554,12 +559,51 @@ class OpenAIBackendAPI:
                 "pixel_ratio": 2,
                 "screen_height": 1440,
                 "screen_width": 2560,
+                "app_name": "chatgpt.com",
             },
+            "paragen_cot_summary_display_override": "allow",
+            "force_parallel_switch": "auto",
         }
         normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
         return payload
+
+    def _prepare_text_conversation(self, path: str, payload: Dict[str, Any]) -> str:
+        """调用 `/f/conversation/prepare` 获取文本对话所需的 conduit token。"""
+        prompt = ""
+        for item in reversed(payload.get("messages") or []):
+            if ((item.get("author") or {}).get("role") or "") == "user":
+                prompt = next((part for part in (item.get("content") or {}).get("parts") or [] if isinstance(part, str)), "")
+                break
+        prepare_payload = {
+            "action": "next",
+            "fork_from_shared_post": False,
+            "parent_message_id": payload["parent_message_id"],
+            "model": payload["model"],
+            "client_prepare_state": "success",
+            "timezone_offset_min": payload["timezone_offset_min"],
+            "timezone": payload["timezone"],
+            "conversation_mode": payload["conversation_mode"],
+            "system_hints": payload["system_hints"],
+            "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "client_contextual_info": {"app_name": "chatgpt.com"},
+        }
+        if payload.get("thinking_effort"):
+            prepare_payload["thinking_effort"] = payload["thinking_effort"]
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
+            json=prepare_payload,
+            timeout=60,
+        )
+        ensure_ok(response, path)
+        conduit_token = str(response.json().get("conduit_token") or "")
+        if not conduit_token:
+            raise RuntimeError(f"missing conduit_token: {response.text}")
+        return conduit_token
 
     def _image_model_settings(self, model: str) -> tuple[str, str]:
         """把标准图片模型名映射为上游模型及思考强度。"""
@@ -2574,9 +2618,10 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
+        conduit_token = self._prepare_text_conversation(path + "/prepare", payload)
         response = self.session.post(
             self.base_url + path,
-            headers=self._conversation_headers(path, requirements),
+            headers=self._conversation_headers(path, requirements, conduit_token),
             json=payload,
             timeout=300,
             stream=True,
@@ -2724,8 +2769,8 @@ class OpenAIBackendAPI:
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:
-            return "/backend-api/conversation", "Asia/Shanghai"
-        return "/backend-anon/conversation", "America/Los_Angeles"
+            return "/backend-api/f/conversation", "Asia/Shanghai"
+        return "/backend-anon/f/conversation", "America/Los_Angeles"
 
     def list_models(self) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
