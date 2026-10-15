@@ -4,14 +4,14 @@ services:
       context: .
       dockerfile: Dockerfile
     image: chatgpt2api:custom
-    container_name: chatgpt2api
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "16800:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
+       - TZ=Asia/Shanghai # 设置时区
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json
       
@@ -30,3 +30,11 @@ services:
       
       # 基础 URL (可选)
       # - CHATGPT2API_BASE_URL=https://your-domain.com
+      
+    networks:
+      - sub2api-network
+      
+networks:
+  sub2api-network:
+    name: sub2api_sub2api-network
+    external: true
